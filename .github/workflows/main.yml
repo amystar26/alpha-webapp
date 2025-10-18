@@ -1,0 +1,103 @@
+name: Full CI/CD to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Environment variables
+env:
+  DOCKER_HUB_REPO: adityak404/flask-todo-app
+  CONTAINER_NAME: flask-app-container
+  APP_PORT: 5000  # Port the Flask app runs on inside the container
+  HOST_PORT: 80   # Port exposed on the EC2 instance (e.g., HTTP)
+
+jobs:
+  # ==================================
+  # CI JOB: BUILD AND PUSH TO DOCKER HUB
+  # ==================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📦 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 🔨 Build and Tag Docker Image
+        id: docker_build
+        run: |
+          BUILD_TAG=${{ github.run_number }}
+          echo "Building image with tag: $BUILD_TAG"
+          # Build with unique tag and 'latest' tag
+          docker build -t ${DOCKER_HUB_REPO}:${BUILD_TAG} .
+          docker tag ${DOCKER_HUB_REPO}:${BUILD_TAG} ${DOCKER_HUB_REPO}:latest
+          echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV # Store tag for the push step
+
+      - name: ⬆️ Push to Docker Hub
+        run: |
+          docker push ${DOCKER_HUB_REPO}:${{ env.BUILD_TAG }}
+          docker push ${DOCKER_HUB_REPO}:latest
+
+      - name: 🧹 Clean Up Local Images
+        if: always()
+        run: docker system prune -f
+
+      - name: Set Image Tag Output
+        # This step makes the tag available to the subsequent deploy job
+        id: set_tag
+        run: echo "image_tag=${{ env.BUILD_TAG }}" >> $GITHUB_OUTPUT
+    
+    # Define outputs to be used by the next job
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.image_tag }}
+
+  # ==================================
+  # CD JOB: DEPLOY TO AWS EC2
+  # ==================================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push # Ensures this job only runs after CI succeeds
+    environment: production # Optional: use a deployment environment
+
+    steps:
+      - name: 🔑 Set up SSH connection
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          
+      - name: 🚀 Deploy to AWS EC2 Instance
+        run: |
+          # Use variables from the 'build-and-push' job
+          DOCKER_IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+          
+          # Deployment command executed on the remote EC2 instance via SSH
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            
+            # 1. Log in to Docker Hub on the EC2 instance (optional if using AWS ECR)
+            # This step assumes the EC2 instance is configured to log into Docker Hub 
+            # or the repo is public. If not, this is where you'd execute a login command.
+            
+            # 2. Pull the newly pushed image
+            echo "Pulling image: ${DOCKER_HUB_REPO}:latest"
+            docker pull ${DOCKER_HUB_REPO}:latest
+            
+            # 3. Stop and remove the old container
+            echo "Stopping and removing old container: ${CONTAINER_NAME}"
+            docker stop ${CONTAINER_NAME} || true
+            docker rm ${CONTAINER_NAME} || true
+            
+            # 4. Run the new container, mapping host port to container port
+            echo "Running new container from image: ${DOCKER_HUB_REPO}:latest"
+            docker run -d \
+              --name ${CONTAINER_NAME} \
+              -p ${HOST_PORT}:${APP_PORT} \
+              ${DOCKER_HUB_REPO}:latest
+              
+            echo "Deployment complete! Application should be accessible on port ${HOST_PORT}."
+          EOF
